@@ -17,6 +17,7 @@
 #   improve openai requsts / consider chains
 #       -> e.g. if device=robot get this and this data
 #       -> if another type, e.g. inductive sensor ask for another data
+#   test different query modes https://gpt-index.readthedocs.io/en/v0.5.27/reference/query.html#gpt_index.indices.query.schema.QueryMode
 
 
 import argparse
@@ -27,10 +28,10 @@ parser = argparse.ArgumentParser(
 )
 
 parser.add_argument("-fs", "--filenames", nargs="+", default=[])
-parser.add_argument("-u", "--url")  # option that takes a value
-parser.add_argument("-c", "--collection")  # option that takes a value
-parser.add_argument("-k", "--similarity_top_k", default=3)  # option that takes a value
-
+parser.add_argument("-u", "--url")
+parser.add_argument("-c", "--collection")
+parser.add_argument("-k", "--similarity_top_k", default=3)
+parser.add_argument("-d", "--debug", action="store_true")
 
 args = parser.parse_args()
 
@@ -41,7 +42,10 @@ logger = logging.getLogger("DefaultLogger")
 streamHandler = logging.StreamHandler(sys.stdout)
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 streamHandler.setFormatter(formatter)
-logger.setLevel(logging.DEBUG)
+if args.debug:
+    logger.setLevel(logging.DEBUG)
+else:
+    logger.setLevel(logging.INFO)
 logger.addHandler(streamHandler)
 
 from llama_index import QueryBundle
@@ -117,6 +121,7 @@ def load_documents(filenames, url):
     # load from url
     from llama_index import download_loader
     from langchain.document_loaders import WebBaseLoader
+    from llama_index import Document
 
     ReadabilityWebPageReader = download_loader("ReadabilityWebPageReader")
     # or set proxy server for playwright: loader = ReadabilityWebPageReader(proxy="http://your-proxy-server:port")
@@ -128,8 +133,8 @@ def load_documents(filenames, url):
         loader_url_lang = WebBaseLoader(url)
         data = loader_url_lang.load()
         doc = loader_url.load_data(url=url)
-        doc[0].text = (
-            doc[0].text + data[0].page_content
+        doc.append(
+            Document(text=data[0].page_content)
         )  # add information from different url reader
         documents = documents + doc
 
@@ -139,8 +144,10 @@ def load_documents(filenames, url):
     pdf_reader = LayoutPDFReader(llmsherpa_api_url)
     for file in filenames:
         logger.info("--------------------- Load document {} \n".format(file))
-        # doc = loader_pdf.load(file_path=file)
-        doc_sherpa = pdf_reader.read_pdf(file)
+        doc = loader_pdf.load(file_path=file)
+        documents = documents + doc
+        # logger.info("--------------------- PDF read with Sherpa \n")
+        # doc_sherpa = pdf_reader.read_pdf(file)
 
     # remove fields having value None -> cause error
     for doc in documents:
@@ -148,13 +155,13 @@ def load_documents(filenames, url):
             if doc.metadata[key] is None:
                 doc.metadata[key] = 0
 
-    return documents, doc_sherpa
+    return documents
 
 
 def load_documents_to_db(filenames, url, vector_store):
     """load data to vector database collection"""
 
-    documents, doc_sherpa = load_documents(filenames, url)
+    documents = load_documents(filenames, url)
 
     text_splitter = SentenceSplitter(
         chunk_size=1024,
@@ -184,7 +191,10 @@ def load_documents_to_db(filenames, url, vector_store):
             sentences.append(window)
         paragraphs = [" ".join(s) for s in sentences]
         for i, p in enumerate(paragraphs):
-            paragraphs[i] = re.sub(r"\.\.\.\.+", " ", p)  # remove dots
+            pp = re.sub(r"\.\.\.\.+", " ", p)  # remove dots
+            paragraphs[i] = re.sub(r"\. \. \. \. +", " ", pp)  # remove dots
+            if "cookie" in paragraphs[i]:  # remove paragraphs with word cookie
+                paragraphs[i] = ""
         # text_chunks.extend(paragraphs)
         text_chunks = paragraphs
         doc_idxs.extend([doc_idx] * len(paragraphs))
@@ -203,15 +213,17 @@ def load_documents_to_db(filenames, url, vector_store):
     # add from sherpas pdf rearder
     from llama_index.readers.schema.base import Document
 
-    for chunk in doc_sherpa.chunks():
-        nodes.append(Document(text=chunk.to_context_text(), extra_info={}))
+    # for chunk in doc_sherpa.chunks():
+    #    nodes.append(Document(text=chunk.to_context_text(), extra_info={}))
 
     for node in nodes:
+        print(node.text)
         node_embedding = embed_model.get_text_embedding(
             node.get_content(metadata_mode="all")
         )
         node.embedding = node_embedding
 
+    logger.info("--------------------- Add data to the vector store \n")
     vector_store.add(nodes)
 
 
@@ -231,7 +243,7 @@ def get_query_engine(response_schemas):
         retriever,
         service_context=service_context,
         text_qa_template=qa_prompt,
-        # refine_template=refine_prompt,
+        refine_template=refine_prompt,
     )
 
     return query_engine
@@ -273,6 +285,27 @@ class VectorDBRetriever(BaseRetriever):
         return nodes_with_scores
 
 
+def make_llm_request(query_engine, query_str):
+    response_dict = []
+    response = query_engine.query(query_str)
+    response_dict = json.loads(
+        re.sub(r"json", "", re.sub(r"```", "", response.response))
+    )
+    print(response.response)
+
+    if logger.getEffectiveLevel() == logging.DEBUG:
+        for idx, node in enumerate(response.source_nodes):
+            print(
+                "######################################### \
+                  Node {} with text \n: {}".format(
+                    idx, node.text
+                )
+            )
+            print("######################################### \n")
+
+    return response, response_dict
+
+
 # create vector store and get collection
 import chromadb
 from llama_index.storage.storage_context import StorageContext
@@ -291,7 +324,8 @@ else:
 retriever = VectorDBRetriever(
     vector_store,
     embed_model,
-    query_mode="default",
+    # query_mode="default",
+    query_mode="simple",
     similarity_top_k=int(args.similarity_top_k),
 )
 
@@ -341,6 +375,9 @@ motor_types = ["Stepper motor", "DC motor", "Brushless DC motor / BLDC", "Servom
 serial_connection_types = ["I2C / IIC", "1-Wire", "SPI", "UART", "RS-232"]
 
 
+################################################# ask product details ################################################
+
+
 # define output schema
 document_description = ResponseSchema(
     name="document_description", description="What is this technical document about?"
@@ -361,37 +398,11 @@ response_schemas = [
 ]
 
 query_engine = get_query_engine(response_schemas)
-
 query_str = "What is this technical document/manual/specification about? What is company name? What is the product name?"
-response_device = query_engine.query(query_str)
+response_device, response_device_dict = make_llm_request(query_engine, query_str)
 
-response_device_dict = json.loads(
-    re.sub(r"json", "", re.sub(r"```", "", response_device.response))
-)
-print(response_device)
 
-#    gpt3.5-turbo:
-#   ```json
-#   {
-#   	"document_description": "This technical document is a manual for the iPOS 233 CANopen drive.",
-#   	"company_name": "Technosoft",
-#   	"product_name": "iPOS 233 CANopen",
-#   	"product_description": "The iPOS 233 CANopen is a drive/motor system that offers various features such as integrated
-#           absolute position sensor, over-current and over-temperature protection, data acquisition capabilities, and multiple h/w addresses."
-#   }
-#   ```
-#   gpt4 output:
-#     ```json
-#     {
-#     	"document_description": "This technical document appears to be a manual or specification for a drive or motor controller, detailing
-#           its various modes of operation, input and output specifications, and various other technical details.",
-#     	"company_name": "Technosoft",
-#     	"product_name": "iPOS 233 CANopen",
-#     	"product_description": "The iPOS 233 CANopen is a drive or motor controller. It features digital and analogue I/Os,
-#           integrated absolute position sensor, protections such as over-current and over-temperature, and has hardware addresses
-#           selectable by hex switch. It also has SRAM for data acquisition and E2ROM for motion programs and data storage."
-#     }
-#      ```
+################################################# ask device type ################################################
 
 # define output schema
 device_type = ResponseSchema(
@@ -402,212 +413,142 @@ device_type = ResponseSchema(
 )
 
 response_schemas = [device_type]
-
 query_engine = get_query_engine(response_schemas)
-
 query_str = "What is the device type from the list {} based on the following device description {}?".format(
     device_types, response_device.response
 )
-
-response_device_type = query_engine.query(query_str)
-response_device_type_dict = json.loads(
-    re.sub(r"json", "", re.sub(r"```", "", response_device_type.response))
+response_device_type, response_device_type_dict = make_llm_request(
+    query_engine, query_str
 )
-print(response_device_type_dict)
+
+################################################# ask interfaces ################################################
 
 # define output schema
 interfaces = ResponseSchema(
     name="interfaces",
-    description="What interfaces is this product {} supporting?".format(
-        response_device.response
-    ),
-    type="list",
-)
-interfaces_choices = ResponseSchema(
-    name="interfaces_choices",
-    description="Select zero, one or multiple only and only from this list {}".format(
-        interface_types
+    description="What interfaces is this device {device} supporting? Select zero, one or multiple from the list {interface_types}".format(
+        device=response_device.response, interface_types=interface_types
     ),
     type="list",
 )
 specific_information_interfaces = ResponseSchema(
     name="specific_information_interfaces",
-    description="What specific about interfaces that this product supports {}?".format(
-        response_device.response
-    ),
+    description="What specific about interfaces that this device supports?",
+    type="string",
 )
 
-response_schemas = [interfaces, interfaces_choices, specific_information_interfaces]
+response_schemas = [interfaces, specific_information_interfaces]
 
 query_engine = get_query_engine(response_schemas)
-
 query_str = "What interfaces is this product {} supporting? Select zero, one or multiple from the list {}.".format(
     response_device.response, interface_types
 )
+response_interfaces, response_interfaces_dict = make_llm_request(
+    query_engine, query_str
+)
 
-response_interfaces = query_engine.query(query_str)
-print(response_interfaces)
-#    gpt3.5-turbo:
-#   ```json
-#   {
-#   	"interfaces": ["CAN"],
-#   	"specific_information_interfaces": "The iPOS 233 CANopen drive supports the CAN interface.
-#           It also has digital inputs (IN0, IN1, IN2/LSP, IN3/LSN, Enable) and digital outputs (OUT0, OUT1) for general-purpose use."
-#   }
-#   ```
-#
-#   gpt4 output
-#   ```json
-#   {
-#   	"interfaces": "RS-232, CAN",
-#   	"specific_information_interfaces": "The iPOS 233 CANopen supports RS-232 and CAN interfaces.
-#           The RS-232 interface has a software selectable bit rate between 9600 and 115200 Baud.
-#           The CAN interface complies with ISO11898 and CiA 402v3.0, with a software selectable bit rate between 125 and 1000 Kbps."
-#   }
-#   ```
-
+################################################# ask protocols ################################################
 
 protocols = ResponseSchema(
     name="protocols",
-    description="What communication protocols is this product {} supporting? ".format(
-        response_device.response
+    description="What communication protocols is this product {device} supporting? Select zero, one or multiple from the list {protocol_types}".format(
+        device=response_device.response, protocol_types=protocol_types
     ),
     type="list",
 )
 specific_information_protocols = ResponseSchema(
     name="specific_information_protocols",
-    description="What specific about communication protocols that this product supports {}?".format(
-        response_device.response
-    ),
+    description="What specific about communication protocols that this device supports ?",
 )
 
-protocols_choices = ResponseSchema(
-    name="protocols_choices",
-    description="Select zero, one or multiple only and only from this list {}".format(
-        protocol_types
-    ),
-    type="list",
-)
-
-response_schemas = [protocols, protocols_choices, specific_information_protocols]
+response_schemas = [protocols, specific_information_protocols]
 
 query_engine = get_query_engine(response_schemas)
-
 query_str = "What protocols is this product {} supporting? Select zero, one or multiple from the list {}.".format(
     response_device.response, protocol_types
 )
+response_protocol, response_protocol_dict = make_llm_request(query_engine, query_str)
 
-response_protocol = query_engine.query(query_str)
-print(response_protocol)
-
-#   gpt3.5-turbo:
-#   ```json
-#   {
-#   	"protocols": "Canopen",
-#   	"specific_information_protocols": "The iPOS 233 CANopen drive supports the CANopen protocol for communication."
-#   }
-#   ```
-#
-#   gpt4 output:
-#   ```json
-#   {
-#   	"protocols": "Canopen",
-#   	"specific_information_protocols": "The iPOS 233 CANopen supports the TMLCAN and CANopen (CiA 402 v3.0) protocols, which are selectable by a hardware pin. It does not support Profinet or Modbus protocols."
-#   }
-#   ```
-
-
-#   # define output schema
-#   missing_interfaces = ResponseSchema(name="missing_interfaces",
-#                                description="Are there missing interfaces that devive {} is supporting and that are missing on this list?".format(response_device.response,response_interfaces.response))
-#   response_schemas = [missing_interfaces]
-#
-#   query_engine = get_query_engine(response_schemas)
-#
-#   query_str = "Are there missing interfaces that devive {} is supporting and that are missing on this list?".format(response_device.response,response_interfaces.response)
-#
-#   response_missing_interfaces = query_engine.query(query_str)
-#   print(response_missing_interfaces)
-
+################################################# ask serial protocols ################################################
 
 serial_communication = ResponseSchema(
     name="serial_connection",
-    description="What serial protocols is this product {} supporting?".format(
-        response_device.response
+    description="What serial protocols is this product {device} supporting? Select zero, one or multiple from the list {serial_connection_types}".format(
+        device=response_device.response, serial_connection_types=serial_connection_types
     ),
     type="list",
 )
 specific_information_serial_communication = ResponseSchema(
     name="specific_information_protocols",
-    description="What specific about serial protocols that this product supports {}?".format(
-        response_device.response
-    ),
+    description="What specific about serial communication protocols that this product supports?",
 )
-
-serial_communication_choices = ResponseSchema(
-    name="serial_communication_choices",
-    description="Select zero, one or multiple only and only from this list {}".format(
-        serial_connection_types
-    ),
-    type="list",
-)
-
 response_schemas = [
     serial_communication,
-    serial_communication_choices,
     specific_information_serial_communication,
 ]
 
 query_engine = get_query_engine(response_schemas)
 
-query_str = "What serial protocols is this product {} supporting? ".format(
-    response_device.response
+query_str = "What serial protocols is this product {} supporting? Select zero, one or multiple from the list {}.".format(
+    response_device.response, serial_connection_types
 )
 
-response_serial_communication = query_engine.query(query_str)
-print(response_serial_communication)
+response_serial_communication, response_serial_communication_dict = make_llm_request(
+    query_engine, query_str
+)
+
+################################################# ask operating voltage ################################################
 
 # define output schema
 operating_voltage_min = ResponseSchema(
     name="operating_voltage_min",
-    description="What is the recommended operating supply voltage minimum?",
+    description="What is the recommended minimum operating rated supply voltage in volts [V] for the device {}?".format(
+        response_device.response
+    ),
+    type="int",
 )
 
 operating_voltage_max = ResponseSchema(
     name="operating_voltage_max",
-    description="What is the recommended operating supply voltage maximum?",
+    description="What is the recommended maximum operating rated supply voltage in volts [V] for the device {}?".format(
+        response_device.response
+    ),
+    type="int",
 )
 
 response_schemas = [operating_voltage_min, operating_voltage_max]
 
 query_engine = get_query_engine(response_schemas)
 
-query_str = "What are the minimum and maximum operating supply voltage for this device {}?".format(
+query_str = "What are the minimum and maximum operating rated supply voltage for this device {}?".format(
     response_device.response
 )
 
-response_voltage = query_engine.query(query_str)
-print(response_voltage)
-#   ```json
-#   {
-#   	"operating_voltage": "12 - 48 VDC",
-#   	"digital_inputs": "5",
-#   	"digital_outputs": "2"
-#   }
-#   ```
+response_voltage, response_voltage_dict = (
+    response_protocol,
+    response_protocol_dict,
+) = make_llm_request(query_engine, query_str)
+
+################################################# ask robot specs ################################################
 
 
 def ask_robot_specs():
     payload = ResponseSchema(
-        name="payload", description="What is the robots maximum payload?"
+        name="payload",
+        description="What is the robots maximum payload in kilograms [kg]?",
+        type="int",
     )
 
     reach = ResponseSchema(
-        name="reach", description="What is reach of the robots end-effector?"
+        name="reach",
+        description="What is reach in meters [m] of the robots end-effector?",
+        type="int",
     )
 
     workspace_coverage = ResponseSchema(
-        name="reach", description="What is the robots workspace_coverage?"
+        name="workspace_coverage",
+        description="What is the robots workspace coverage in percentage [%]?",
+        type="int",
     )
 
     response_schemas = [payload, reach, workspace_coverage]
@@ -615,12 +556,42 @@ def ask_robot_specs():
     query_engine = get_query_engine(response_schemas)
 
     query_str = "What are the specifications as payload, reach and workspace coverage for the device {} with the description?".format(
-        response_device_type_dict["device_type"], response_device.response
+        response_device_type_dict["device_type"]
     )
 
-    response_voltage = query_engine.query(query_str)
-    print(response_voltage)
+    response_voltage, response_voltage_dict = make_llm_request(query_engine, query_str)
+
+
+def ask_robot_specs2():
+    weight = ResponseSchema(
+        name="weight",
+        description="What is the robots weight in kilograms [kg]?",
+        type="int",
+    )
+
+    number_of_axes = ResponseSchema(
+        name="number_of_axes",
+        description="What number of axes does this robot has?",
+        type="int",
+    )
+
+    repeatability = ResponseSchema(
+        name="repeatability",
+        description="What is the robots repeatability (ISO 9283) in [mm]?",
+        type="int",
+    )
+
+    response_schemas = [weight, number_of_axes, repeatability]
+
+    query_engine = get_query_engine(response_schemas)
+
+    query_str = "What are the specifications as weight, number of axes and repeatability for the device {} with the description?".format(
+        response_device_type_dict["device_type"]
+    )
+
+    response_voltage, response_voltage_dict = make_llm_request(query_engine, query_str)
 
 
 if response_device_type_dict["device_type"] == "Robot Arm":
     ask_robot_specs()
+    ask_robot_specs2()
