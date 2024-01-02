@@ -296,6 +296,8 @@ if args.insert_in_sql:
                 == DeviceType.PLC_INDUSTRIAL_PC.name
                 or response_plc_dict["device_type_name"]
                 == DeviceType.PLC_IO_MODULE_SYSTEM.name
+                or response_plc_dict["device_type_name"]
+                == DeviceType.PLC_BASE_UNIT.name
             ):
                 logger.info(
                     "Inserting into tables {} and {}".format(
