@@ -240,6 +240,12 @@ To load the data from different sources for a component, create a ```json``` fil
 }
 ```
 
+##### Batch load
+
+```bash
+python3 batch_load.py
+```
+
 
 ## Useful Links
 
