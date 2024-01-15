@@ -145,7 +145,6 @@ To use multiple tools, generate multiple Thoughts, maxumum 5. Select appropriate
 Start always with "Thought x". Don't any text before.
 "Action Input x" should be a compound and detailed sentence, covering different aspects of the corresponding "Thought x".
 You can use same tool multiple times with different Action Inputs. 
-
 Important: Always try to generate multiple Thoughts and Action Inputs to get as much details about context as possible.
 Always use the following format, even if you have only one thought and need to use only one tool. 
 
